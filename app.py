@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 import datetime
+from dateutil.relativedelta import relativedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -9,7 +10,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Análisis Global Ventas - CRA", layout="wide")
 st.title("🌍 CRA INT: Análisis Global de Ventas y Demanda")
-st.markdown("Análisis macro de ventas (2025 - 2026) por Línea y Categoría a nivel compañía.")
+st.markdown("Análisis macro de ventas (Últimos 12 Meses) por Línea y Categoría a nivel compañía.")
 
 # --- CONEXIÓN A GOOGLE DRIVE ---
 @st.cache_resource
@@ -40,12 +41,11 @@ def descargar_archivo_drive(file_id):
         return file
     except Exception: return None
 
-def buscar_archivos_ventas_globales():
+def buscar_archivos_ventas_globales(anios):
     archivos_encontrados = []
     if not MASTER_SALES_ID: return []
     
     sucursales = ["CUAUTITLAN", "TULTITLAN", "BAJIO"]
-    anios = ["2025", "2026"]
     
     for suc in sucursales:
         for anio in anios:
@@ -73,13 +73,20 @@ def clasificar_demanda(hits):
     else: return "NULA"
 
 def procesar_analisis_global(bar_obj):
-    files_metadata = buscar_archivos_ventas_globales()
-    if not files_metadata: return None
+    # 1. Definir rango de fechas (12 meses cerrados)
+    hoy = datetime.datetime.now()
+    fecha_fin = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    fecha_inicio = fecha_fin - relativedelta(years=1)
+    
+    anios_drive = list(set([fecha_inicio.year, fecha_fin.year]))
+    
+    files_metadata = buscar_archivos_ventas_globales(anios_drive)
+    if not files_metadata: return None, fecha_inicio, fecha_fin
     
     dfs = []
     total_files = len(files_metadata)
     
-    # 1. Descarga Masiva
+    # 2. Descarga Masiva
     for i, file_meta in enumerate(files_metadata):
         content = descargar_archivo_drive(file_meta['id'])
         if content:
@@ -88,25 +95,31 @@ def procesar_analisis_global(bar_obj):
                 df_temp = pd.read_excel(content, engine=engine)
                 df_temp.columns = df_temp.columns.str.upper().str.strip()
                 
-                # Solo traemos las columnas que nos importan para no saturar la memoria
-                cols_necesarias = [c for c in df_temp.columns if c in ['NP', 'DESCR', 'CATEGORIA', 'LINEA', 'CANTIDAD']]
+                # Importante: Ahora incluimos FECHA para poder hacer el corte exacto de los 12 meses
+                cols_necesarias = [c for c in df_temp.columns if c in ['NP', 'DESCR', 'CATEGORIA', 'LINEA', 'CANTIDAD', 'FECHA']]
                 dfs.append(df_temp[cols_necesarias])
             except Exception: pass
         
-        # Actualizar barra
-        progreso = int((i + 1) / total_files * 40) # Toma el 40% del proceso
+        progreso = int((i + 1) / total_files * 40)
         bar_obj.progress(progreso, text=f"Descargando bases de datos ({i+1}/{total_files})...")
         
-    if not dfs: return None
+    if not dfs: return None, fecha_inicio, fecha_fin
     
-    bar_obj.progress(45, text="Unificando matriz de datos global...")
+    bar_obj.progress(45, text="Aplicando filtro de 12 meses exactos...")
     df_global = pd.concat(dfs, ignore_index=True)
+    
+    # 3. Filtrado estricto por fechas
+    if 'FECHA' in df_global.columns:
+        df_global['FECHA'] = pd.to_datetime(df_global['FECHA'], dayfirst=True, errors='coerce')
+        mask = (df_global['FECHA'] >= fecha_inicio) & (df_global['FECHA'] < fecha_fin)
+        df_global = df_global[mask].copy()
+    
+    if df_global.empty: return None, fecha_inicio, fecha_fin
     
     # Limpieza de datos base
     df_global['NP'] = df_global['NP'].astype(str).str.strip()
     df_global['CANTIDAD'] = pd.to_numeric(df_global['CANTIDAD'], errors='coerce').fillna(0)
     
-    # Si alguna fila no tiene categoría o línea, le ponemos "SIN DEFINIR"
     if 'CATEGORIA' not in df_global.columns: df_global['CATEGORIA'] = "SIN DEFINIR"
     if 'LINEA' not in df_global.columns: df_global['LINEA'] = "SIN DEFINIR"
     
@@ -115,8 +128,7 @@ def procesar_analisis_global(bar_obj):
     
     bar_obj.progress(60, text="Agrupando por Número de Parte y calculando métricas...")
     
-    # 2. Agrupación Matemática
-    # Agrupamos por NP y tomamos la primera descripción, categoria y linea que aparezca. Y sumamos cantidades.
+    # 4. Agrupación Matemática
     resumen = df_global.groupby('NP').agg(
         DESCR=('DESCR', 'first'),
         CATEGORIA=('CATEGORIA', 'first'),
@@ -128,23 +140,22 @@ def procesar_analisis_global(bar_obj):
     
     bar_obj.progress(80, text="Calculando HITS y nivel de DEMANDA...")
     
-    # 3. Cálculo de HITS y DEMANDA
+    # 5. Cálculo de HITS y DEMANDA
     resumen['HITS'] = (resumen['total_ev'] - (resumen['neg_ev'] * 2)).clip(lower=0)
     
-    # Filtramos piezas que no tuvieron ni venta ni hits reales (basura del sistema)
+    # Filtramos la basura
     resumen = resumen[(resumen['VENTA'] != 0) | (resumen['HITS'] > 0)].reset_index(drop=True)
     
-    # Aplicar clasificación de demanda
+    # Aplicar clasificación
     resumen['DEMANDA'] = resumen['HITS'].apply(clasificar_demanda)
     
-    # Seleccionar y ordenar las columnas finales pedidas
+    # Selección y orden final
     columnas_finales = ['NP', 'DESCR', 'CATEGORIA', 'LINEA', 'VENTA', 'HITS', 'DEMANDA']
     df_final = resumen[columnas_finales].copy()
     
-    # Ordenar por VENTA de mayor a menor para que el top salga arriba
     df_final.sort_values(by='VENTA', ascending=False, inplace=True)
     
-    return df_final
+    return df_final, fecha_inicio, fecha_fin
 
 # --- GENERACIÓN DE EXCEL CON DISEÑO ---
 def formatear_excel_analisis(writer, df):
@@ -154,29 +165,29 @@ def formatear_excel_analisis(writer, df):
     worksheet.freeze_panes(1, 0)
     worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
     
-    # Formatos Corporativos
+    # Formatos
     fmt_header = workbook.add_format({'bold': True, 'valign': 'vcenter', 'align': 'center', 'bg_color': '#10345C', 'font_color': 'white', 'border': 1})
     fmt_celdas_texto = workbook.add_format({'valign': 'vcenter', 'border': 1, 'border_color': '#D3D3D3'})
     fmt_celdas_num = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#D3D3D3', 'num_format': '0'})
     
-    # Escribir encabezados
+    # Encabezados
     for col_num, value in enumerate(df.columns.values):
         worksheet.write(0, col_num, value, fmt_header)
         
-    # Anchos de columna
-    worksheet.set_column('A:A', 20, fmt_celdas_texto) # NP
-    worksheet.set_column('B:B', 45, fmt_celdas_texto) # DESCR
-    worksheet.set_column('C:D', 25, fmt_celdas_texto) # CATEGORIA, LINEA
-    worksheet.set_column('E:F', 15, fmt_celdas_num)   # VENTA, HITS
-    worksheet.set_column('G:G', 15, fmt_celdas_texto) # DEMANDA
+    # Anchos
+    worksheet.set_column('A:A', 20, fmt_celdas_texto)
+    worksheet.set_column('B:B', 45, fmt_celdas_texto)
+    worksheet.set_column('C:D', 25, fmt_celdas_texto)
+    worksheet.set_column('E:F', 15, fmt_celdas_num)
+    worksheet.set_column('G:G', 15, fmt_celdas_texto)
 
 # --- INTERFAZ GRÁFICA ---
-st.info("💡 Haz clic en el botón para consolidar todas las ventas (2025-2026) a nivel compañía y generar la base de análisis.")
+st.info("💡 Haz clic en el botón para consolidar las ventas del **Último Año Móvil** a nivel compañía.")
 
 if st.button("🚀 Ejecutar Análisis Global (1 Click)"):
     my_bar = st.progress(5, text="Iniciando protocolos de conexión...")
     
-    df_analisis = procesar_analisis_global(my_bar)
+    df_analisis, f_inicio, f_fin = procesar_analisis_global(my_bar)
     
     if df_analisis is not None and not df_analisis.empty:
         my_bar.progress(90, text="🎨 Generando Excel con diseño corporativo...")
@@ -197,10 +208,10 @@ if st.button("🚀 Ejecutar Análisis Global (1 Click)"):
         
         if link:
             st.balloons()
-            st.success(f"🎉 ¡Base de Análisis creada exitosamente! Contiene {len(df_analisis)} productos únicos.")
+            st.success(f"🎉 ¡Base creada! **Periodo analizado: {f_inicio.strftime('%d/%b/%Y')} al {(f_fin - relativedelta(days=1)).strftime('%d/%b/%Y')}**")
             st.markdown(f"### [📂 Abrir Base de Datos en Google Drive]({link})")
             
-            st.write("📊 **Vista Previa del Top 10 Productos más Vendidos a Nivel Compañía:**")
+            st.write(f"📊 **Vista Previa (Total de {len(df_analisis)} productos comercializados):**")
             st.dataframe(df_analisis.head(10))
     else:
-        st.error("No se pudo generar el análisis. Verifica que existan archivos de 2025/2026 en la carpeta origen.")
+        st.error("No se pudo generar el análisis. Verifica que existan ventas en el periodo de los últimos 12 meses.")
