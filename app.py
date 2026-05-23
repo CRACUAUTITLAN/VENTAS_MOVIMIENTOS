@@ -10,7 +10,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Análisis Global Ventas - CRA", layout="wide")
 st.title("🌍 CRA INT: Análisis Global de Ventas y Demanda")
-st.markdown("Análisis macro de ventas (**Últimos 6 Meses**) por Línea y Categoría a nivel compañía.")
+st.markdown("Análisis macro de ventas (**Últimos 12 Meses**) por Línea y Categoría a nivel compañía.")
 
 # --- CONEXIÓN A GOOGLE DRIVE ---
 @st.cache_resource
@@ -67,17 +67,17 @@ def subir_excel_a_drive(buffer, nombre_archivo):
 
 # --- MOTOR DE ANÁLISIS DE DATOS ---
 def clasificar_demanda(hits):
-    # Nueva regla a 6 meses: Alta > 6, Media >=3 y <=6, Baja > 0
-    if hits > 6: return "ALTA"
-    elif hits >= 3: return "MEDIA"
+    # REGLA: >12 = ALTA, >6 MEDIA; BAJA
+    if hits > 12: return "ALTA"
+    elif hits >= 6: return "MEDIA"
     elif hits > 0: return "BAJA"
     else: return "NULA"
 
 def procesar_analisis_global(bar_obj):
-    # 1. Definir rango de fechas (6 MESES CERRADOS)
+    # 1. Definir rango de fechas (12 MESES CERRADOS)
     hoy = datetime.datetime.now()
     fecha_fin = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    fecha_inicio = fecha_fin - relativedelta(months=6) # <-- CAMBIO A 6 MESES AQUI
+    fecha_inicio = fecha_fin - relativedelta(months=12)
     
     anios_drive = list(set([fecha_inicio.year, fecha_fin.year]))
     
@@ -105,10 +105,10 @@ def procesar_analisis_global(bar_obj):
         
     if not dfs: return None, fecha_inicio, fecha_fin
     
-    bar_obj.progress(45, text="Aplicando filtro estricto de 6 meses...")
+    bar_obj.progress(45, text="Aplicando filtro estricto de 12 meses...")
     df_global = pd.concat(dfs, ignore_index=True)
     
-    # 3. Filtrado estricto por fechas (Semestre Móvil)
+    # 3. Filtrado estricto por fechas (Año Móvil)
     if 'FECHA' in df_global.columns:
         df_global['FECHA'] = pd.to_datetime(df_global['FECHA'], dayfirst=True, errors='coerce')
         mask = (df_global['FECHA'] >= fecha_inicio) & (df_global['FECHA'] < fecha_fin)
@@ -146,7 +146,7 @@ def procesar_analisis_global(bar_obj):
     # Filtramos la basura
     resumen = resumen[(resumen['VENTA'] != 0) | (resumen['HITS'] > 0)].reset_index(drop=True)
     
-    # Aplicar nueva clasificación a 6 meses
+    # Aplicar nueva clasificación a 12 meses
     resumen['DEMANDA'] = resumen['HITS'].apply(clasificar_demanda)
     
     # Selección y orden final
@@ -182,7 +182,7 @@ def formatear_excel_analisis(writer, df):
     worksheet.set_column('G:G', 15, fmt_celdas_texto)
 
 # --- INTERFAZ GRÁFICA ---
-st.info("💡 Haz clic en el botón para consolidar las ventas del **Último Semestre Móvil (6 meses)** a nivel compañía.")
+st.info("💡 Haz clic en el botón para consolidar las ventas del **Último Año Móvil (12 meses)** a nivel compañía.")
 
 if st.button("🚀 Ejecutar Análisis Global (1 Click)"):
     my_bar = st.progress(5, text="Iniciando protocolos de conexión...")
@@ -201,7 +201,7 @@ if st.button("🚀 Ejecutar Análisis Global (1 Click)"):
             
         buffer.seek(0)
         fecha_str = datetime.datetime.now().strftime("%d_%m_%Y")
-        name_file = f"Analisis_Demanda_6M_{fecha_str}.xlsx"
+        name_file = f"Analisis_Demanda_12M_{fecha_str}.xlsx"
         
         my_bar.progress(95, text="☁️ Subiendo base de datos a Google Drive...")
         link = subir_excel_a_drive(buffer, name_file)
@@ -213,7 +213,7 @@ if st.button("🚀 Ejecutar Análisis Global (1 Click)"):
             st.success(f"🎉 ¡Base creada! **Periodo analizado: {f_inicio.strftime('%d/%b/%Y')} al {(f_fin - relativedelta(days=1)).strftime('%d/%b/%Y')}**")
             st.markdown(f"### [📂 Abrir Base de Datos en Google Drive]({link})")
             
-            st.write(f"📊 **Vista Previa (Total de {len(df_analisis)} productos comercializados en este semestre):**")
+            st.write(f"📊 **Vista Previa (Total de {len(df_analisis)} productos comercializados en este año):**")
             st.dataframe(df_analisis.head(10))
     else:
-        st.error("No se pudo generar el análisis. Verifica que existan ventas en el periodo de los últimos 6 meses.")
+        st.error("No se pudo generar el análisis. Verifica que existan ventas en el periodo de los últimos 12 meses.")
